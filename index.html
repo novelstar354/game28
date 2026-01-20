@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>雷神録 - フル統合版</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="icon" href="https://deliver.commons.nicovideo.jp/thumbnail/nc142914?size=l" sizes="16×16" type="image/png" />
+<style>
+html, body { margin: 0; height: 100%; background: #020617; color: #e5ecff; font-family: system-ui; overscroll-behavior: none; }
+.wrap { display: grid; place-items: center; height: 100%; }
+canvas { background: #070b1f; border-radius: 14px; touch-action: none; }
+.ui { font-size: 12px; margin-top: 6px; opacity: .85; text-align: center; }
+.btn { position: absolute; padding: 12px 16px; background: rgba(30, 40, 80, .7); border-radius: 12px; }
+#bombBtn { right: 12px; bottom: 80px; }
+#pauseBtn { right: 12px; top: 12px; }
+.menu { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0, 0, 0, .7); }
+.menuBox { background: #0b1220; padding: 24px 36px; border-radius: 18px; }
+.menuItem { margin: 10px 0; font-size: 22px; opacity: .4; cursor: pointer; transition: transform .25s, opacity .25s, color .25s; }
+.menuItem.sel { opacity: 1; color: #ff6b6b; transform: translateX(14px) scale(1.3); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <canvas id="c" width="360" height="480"></canvas>
+  <div class="ui">
+    PC: 移動WASD/矢印｜Shift低速｜Z射撃｜X AUTO｜Bボム｜Pポーズ<br>
+    スマホ: ドラッグ移動｜2本指低速｜画面タップ射撃
+  </div>
+</div>
+
+<div class="btn" id="bombBtn">BOMB</div>
+<div class="btn" id="pauseBtn">PAUSE</div>
+
+<div class="menu" id="menu">
+  <div class="menuBox">
+    <div class="menuItem sel">Easy</div>
+    <div class="menuItem">Normal</div>
+    <div class="menuItem">Hard</div>
+    <div class="menuItem">Lunatic</div>
+    <div style="opacity: .6; font-size: 12px; margin-top: 14px">↑↓ / Enter</div>
+  </div>
+</div>
+
+<script>
+// ゲーム設定
+const c = document.getElementById("c"), ctx = c.getContext("2d");
+const W = 360, H = 480;
+const keys = {};
+let paused = false, autoFire = true, flash = 0, slowTouch = false, touching = false, touchX = W / 2, touchY = H - 80;
+
+// 入力
+addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (e.key === "p") paused = !paused;
+  if (e.key === "x") autoFire = !autoFire;
+  if (e.key === "b") bombUse();
+});
+addEventListener("keyup", e => keys[e.key] = false);
+c.addEventListener("touchstart", e => { touching = true; slowTouch = e.touches.length >= 2; });
+c.addEventListener("touchmove", e => { e.preventDefault(); const r = c.getBoundingClientRect(), t = e.touches[0]; touchX = (t.clientX - r.left) / r.width * W; touchY = (t.clientY - r.top) / r.height * H; slowTouch = e.touches.length >= 2; }, { passive: false });
+c.addEventListener("touchend", () => { touching = false; slowTouch = false; });
+document.getElementById("bombBtn").onclick = () => bombUse();
+document.getElementById("pauseBtn").onclick = () => paused = !paused;
+
+const hit = (ax, ay, bx, by, r) => ((ax - bx) ** 2 + (ay - by) ** 2 < r * r);
+
+// Lunatic専用設定
+const lunatic = {
+  hp: [500, 1200, 2500, 4000],  // 各難易度のボスHP設定
+  spiral: { interval: 12, num: 12, speed: 2.8 },  // 螺旋弾幕の設定
+  aim: { interval: 10, speed: 2 },  // 追尾弾の設定
+  enemyFreq: [50, 40, 30, 20],  // 雑魚敵の出現頻度
+  enemyShot: { interval: 40, speed: 3, spread: 4 },  // 雑魚敵の弾設定
+  bossAttacks: [
+    { hp: 500, spiral: { interval: 12, num: 6, speed: 1.5 }, aim: { interval: 10, speed: 1 }, attackInterval: 40 },
+    { hp: 1200, spiral: { interval: 12, num: 10, speed: 2.0 }, aim: { interval: 10, speed: 2.5 }, attackInterval: 30 },
+    { hp: 2500, spiral: { interval: 8, num: 15, speed: 3.0 }, aim: { interval: 8, speed: 3.5 }, attackInterval: 20 },
+    { hp: 4000, spiral: { interval: 5, num: 20, speed: 4.0 }, aim: { interval: 5, speed: 5.0 }, attackInterval: 10 },
+  ],
+};
+
+// ゲーム状態
+let mode = null, frame = 0, score = 0, hiScore = 0;
+let bullets = [], shots = [], enemies = [], enemiesBullets = [], items = [], boss = null;
+let life = 3, bomb = 3, inv = 0;
+const MAX_LIFE = 8, MAX_BOMB = 8;
+const player = { x: W / 2, y: H - 60, r: 3, s: 3.2, slow: 1.4 };
+let stage = 0, clearTimer = 0;
+
+// メニュー
+const menu = document.getElementById("menu");
+const itemsMenu = [...document.querySelectorAll(".menuItem")];
+let sel = 0;
+menu.style.display = "grid";
+
+function updateMenu() { itemsMenu.forEach((m, i) => m.classList.toggle("sel", i === sel)); }
+updateMenu();
+itemsMenu.forEach((m, i) => { m.onclick = () => { sel = i; start(); }; });
+addEventListener("keydown", e => {
+  if (menu.style.display !== "grid") return;
+  if (e.key === "ArrowDown") { sel = (sel + 1) % 4; updateMenu(); }
+  if (e.key === "ArrowUp") { sel = (sel + 3) % 4; updateMenu(); }
+  if (e.key === "Enter") start();
+});
+
+// 開始
+function start() {
+  mode = itemsMenu[sel].textContent.toLowerCase();
+  menu.style.display = "none";
+  frame = score = 0; paused = false; bullets = []; shots = []; enemies = []; enemiesBullets = []; items = [];
+  life = 3; bomb = 3; inv = 0; boss = null; clearTimer = 0; stage = 0;
+  hiScore = +localStorage.getItem("hi_" + mode) || 0;
+}
+
+// 自機射撃 3-way連射
+function shoot() {
+  if (frame % 3 !== 0) return;
+
+  if (slowTouch || keys.Shift) {
+    [-0, 0, 0, 0].forEach(dx => { shots.push({ x: player.x + dx, y: player.y - 8, vx: 0, vy: -6 }); });
+  } else {
+    [-8, -4, 0, 4].forEach(dx => { shots.push({ x: player.x + dx, y: player.y - 8, vx: dx * 0.15, vy: -6 }); });
+  }
+}
+
+// ボム
+function bombUse() {
+  if (bomb <= 0) return;
+  bomb--;
+  bullets = [];
+  enemiesBullets = [];
+  inv = 240;
+  flash = 20;
+}
+
+// 更新
+function update() {
+  if (!mode || paused) return;
+  if (mode === "clear") return;
+
+  frame++; score++; if (inv > 0) inv--; if (flash > 0) flash--;
+
+  const sp = slowTouch || keys.Shift ? player.slow : player.s;
+  if (keys.ArrowLeft || keys.a) player.x -= sp;
+  if (keys.ArrowRight || keys.d) player.x += sp;
+  if (keys.ArrowUp || keys.w) player.y -= sp;
+  if (keys.ArrowDown || keys.s) player.y += sp;
+  if (touching) { player.x += (touchX - player.x) * 0.25; player.y += (touchY - player.y) * 0.25; }
+  player.x = Math.max(10, Math.min(W - 10, player.x)); player.y = Math.max(10, Math.min(H - 10, player.y));
+  if (autoFire || touching || keys.z) shoot();
+
+  shots.forEach(s => { s.x += s.vx; s.y += s.vy; });
+  shots = shots.filter(s => s.y > -20);
+
+  // 雑魚生成
+  if (!boss && stage < 4 && frame % lunatic.enemyFreq[sel] === 0) {
+    enemies.push({ x: Math.random() * (W - 20) + 10, y: -10, r: 10, hp: 10, lastShot: 0 });
+  }
+
+  // ボス生成
+  if (!boss && stage < 4 && frame > 600) {
+    boss = {
+      x: W / 2,
+      y: 80,
+      hp: lunatic.bossAttacks[sel].hp,
+      maxHp: lunatic.bossAttacks[sel].hp,
+      patternTimer: 0,
+    };
+    enemies = []; enemiesBullets = []; // ボス戦中雑魚なし
+  }
+
+  // ボス弾幕
+  if (boss) {
+    boss.patternTimer++;
+    boss.x = W / 2 + Math.sin(frame * 0.02) * 60;
+    boss.y = 80 + Math.sin(frame * 0.05) * 10;
+
+    if (frame % lunatic.bossAttacks[sel].spiral.interval === 0) {
+      for (let i = 0; i < lunatic.bossAttacks[sel].spiral.num; i++) {
+        const a = i / lunatic.bossAttacks[sel].spiral.num * Math.PI * 2 + frame * 0.03;
+        bullets.push({ x: boss.x, y: boss.y, vx: Math.cos(a) * lunatic.bossAttacks[sel].spiral.speed, vy: Math.sin(a) * lunatic.bossAttacks[sel].spiral.speed, r: 5, hit: 3 });
+      }
+    }
+
+    if (frame % lunatic.bossAttacks[sel].aim.interval === 0) {
+      const a = Math.atan2(player.y - boss.y, player.x - boss.x);
+      bullets.push({ x: boss.x, y: boss.y, vx: Math.cos(a) * lunatic.bossAttacks[sel].aim.speed, vy: Math.sin(a) * lunatic.bossAttacks[sel].aim.speed, r: 5, hit: 3 });
+    }
+  }
+
+  [...bullets, ...enemiesBullets].forEach(b => { b.x += b.vx; b.y += b.vy; });
+  [...bullets, ...enemiesBullets].forEach(b => {
+    if (inv <= 0 && hit(b.x, b.y, player.x, player.y, b.hit + player.r)) {
+      life--; inv = 120; bullets = []; enemiesBullets = []; flash = 10;
+      if (life < 0) { mode = null; menu.style.display = "grid"; }
+    }
+  });
+
+  bullets = bullets.filter(b => b.x > -40 && b.x < W + 40 && b.y > -40 && b.y < H + 40);
+  enemiesBullets = enemiesBullets.filter(b => b.x > -40 && b.x < W + 40 && b.y > -40 && b.y < H + 40);
+
+  // ショットとボス衝突
+  shots.forEach(s => {
+    if (boss && hit(s.x, s.y, boss.x, boss.y, 22)) {
+      boss.hp--; s.y = -999;
+      if (boss.hp <= 0) {
+        boss = null; stage++;
+        if (stage >= 4) { mode = "clear"; clearTimer = 0; } // 4面クリア
+      }
+    }
+  });
+}
+
+// 描画
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  if (mode === "clear") {
+    ctx.fillStyle = "#fff"; ctx.font = "32px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("CLEAR!", W / 2, H / 2 - 20);
+    ctx.font = "16px sans-serif"; ctx.fillText(`SCORE: ${score}`, W / 2, H / 2 + 10);
+    ctx.fillText(`HI-SCORE: ${hiScore}`, W / 2, H / 2 + 30);
+    return;
+  }
+
+  if (paused) { ctx.fillStyle = "#fff"; ctx.font = "32px sans-serif"; ctx.textAlign = "center"; ctx.fillText("PAUSED", W / 2, H / 2); }
+
+  if (flash > 0) { ctx.fillStyle = "#fff"; ctx.globalAlpha = 0.2; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  shots.forEach(s => { ctx.fillStyle = "#aaf"; ctx.fillRect(s.x - 2, s.y - 8, 4, 8); });
+  enemiesBullets.forEach(b => { ctx.fillStyle = "#f88"; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill(); });
+  bullets.forEach(b => { ctx.fillStyle = "#f55"; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill(); });
+  enemies.forEach(e => {
+    let grad = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, e.r);
+    grad.addColorStop(0, "#6f6"); grad.addColorStop(1, "#0a0");
+    ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2); ctx.fill();
+  });
+  if (boss) {
+    ctx.fillStyle = "#333"; ctx.fillRect(40, 20, 280, 6); 
+    ctx.fillStyle = "#ff66cc"; ctx.fillRect(40, 20, 280 * (boss.hp / boss.maxHp), 6); 
+    ctx.fillStyle = "#ff00ff"; ctx.beginPath(); ctx.arc(boss.x, boss.y, 22, 0, Math.PI * 2); ctx.fill();
+  }
+  if (inv % 10 < 5) { ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(player.x, player.y, 6, 0, Math.PI * 2); ctx.fill(); }
+  ctx.fillStyle = "#fff"; ctx.fillText(`S:${score} HI:${hiScore}`, 6, 14); ctx.fillText(`L:${life} B:${bomb}`, 6, H - 10);
+}
+
+// クリア画面・メニュー戻り
+addEventListener("keydown", e => { if (mode === "clear") { mode = null; menu.style.display = "grid"; } });
+c.addEventListener("touchstart", () => { if (mode === "clear") { mode = null; menu.style.display = "grid"; } });
+c.addEventListener("mousedown", () => { if (mode === "clear") { mode = null; menu.style.display = "grid"; } });
+
+(function loop() { update(); draw(); requestAnimationFrame(loop); })();
+</script>
+
+</body>
+</html>
